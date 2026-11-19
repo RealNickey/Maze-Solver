@@ -34,6 +34,7 @@ export interface DreamTextureSet {
   shrubSoft: THREE.CanvasTexture;
   stoneWall: THREE.CanvasTexture;
   mossPath: THREE.CanvasTexture;
+  goldPath: THREE.CanvasTexture;
   contactShadow: THREE.CanvasTexture;
   skyBackdrop: THREE.CanvasTexture;
   dispose: () => void;
@@ -151,23 +152,52 @@ export function createDreamTextures(): DreamTextureSet {
     }
   });
 
-  // 4. Dreamy turquoise-mint creeping dew moss tile for BFS exploration (16x16)
+  // 4. High-contrast luminous cobalt-periwinkle dew tile for BFS exploration wave (16x16)
   const mossPath = makePixelCanvas(16, 16, (ctx, w, h) => {
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        const v = hash2(Math.floor(x / 2), Math.floor(y / 2), 131);
-        ctx.fillStyle =
-          v < 0.3 ? '#46D49B' : v < 0.65 ? '#39C490' : v < 0.88 ? '#64E3AE' : '#84F0C2';
+        const border = x === 0 || y === 0 || x === w - 1 || y === h - 1;
+        if (border) {
+          ctx.fillStyle = '#2563EB';
+        } else {
+          const v = hash2(Math.floor(x / 2), Math.floor(y / 2), 131);
+          ctx.fillStyle =
+            v < 0.28 ? '#3B82F6' : v < 0.62 ? '#4F94FC' : v < 0.88 ? '#60A5FA' : '#7DD3FC';
+        }
         ctx.fillRect(x, y, 1, 1);
       }
     }
-    // Luminous sky-dew sparkles
-    ctx.fillStyle = '#B8F6FF';
+    // Crisp sunlit dewdrop sparkles
+    ctx.fillStyle = '#E0F2FE';
     ctx.fillRect(3, 4, 2, 1);
     ctx.fillRect(10, 11, 2, 1);
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(4, 4, 1, 1);
     ctx.fillRect(11, 11, 1, 1);
+  });
+
+  // 4b. Radiant sunlit golden-amber & rose-petal stepping carpet for unmistakable Optimal Shortest Path (16x16)
+  const goldPath = makePixelCanvas(16, 16, (ctx, w, h) => {
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const border = x === 0 || y === 0 || x === w - 1 || y === h - 1;
+        if (border) {
+          ctx.fillStyle = '#EA580C';
+        } else {
+          const v = hash2(Math.floor(x / 2), Math.floor(y / 2), 211);
+          ctx.fillStyle =
+            v < 0.25 ? '#F59E0B' : v < 0.6 ? '#FBBF24' : v < 0.86 ? '#FDE047' : '#FEF08A';
+        }
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+    // Scattered scarlet-poppy & rose petals along the golden path
+    ctx.fillStyle = '#F43F5E';
+    ctx.fillRect(3, 3, 2, 2);
+    ctx.fillRect(11, 10, 2, 2);
+    ctx.fillStyle = '#FFFBEB';
+    ctx.fillRect(9, 4, 2, 1);
+    ctx.fillRect(4, 12, 2, 1);
   });
 
   // 5. Soft radial contact shadow (32x32)
@@ -247,6 +277,7 @@ export function createDreamTextures(): DreamTextureSet {
     shrubSoft,
     stoneWall,
     mossPath,
+    goldPath,
     contactShadow,
     skyBackdrop,
     dispose: () => {
@@ -254,6 +285,7 @@ export function createDreamTextures(): DreamTextureSet {
       shrubSoft.dispose();
       stoneWall.dispose();
       mossPath.dispose();
+      goldPath.dispose();
       contactShadow.dispose();
       skyBackdrop.dispose();
     },

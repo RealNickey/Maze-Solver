@@ -138,13 +138,11 @@ export function FlatMazeCanvas({
       }
     }
 
-    // 4. Crisp 2D shortest path polyline
+    // 4. Crisp high-contrast 2D shortest path polyline (crimson-coral with bright sunlit core)
     if (bfsSnapshot && bfsSnapshot.bloomedPath.length > 0) {
       ctx.save();
-      ctx.strokeStyle = '#15803D';
-      ctx.lineWidth = Math.max(3, Math.round(tilePx * 0.34));
-      ctx.lineCap = 'square';
-      ctx.lineJoin = 'miter';
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       ctx.beginPath();
       bfsSnapshot.bloomedPath.forEach((cell, idx) => {
         const cx = offsetX + (2 * cell.col + 1.5) * tilePx;
@@ -152,6 +150,12 @@ export function FlatMazeCanvas({
         if (idx === 0) ctx.moveTo(cx, cy);
         else ctx.lineTo(cx, cy);
       });
+      ctx.strokeStyle = '#E11D48';
+      ctx.lineWidth = Math.max(4, Math.round(tilePx * 0.44));
+      ctx.stroke();
+
+      ctx.strokeStyle = '#FDE047';
+      ctx.lineWidth = Math.max(1.5, Math.round(tilePx * 0.16));
       ctx.stroke();
       ctx.restore();
     }

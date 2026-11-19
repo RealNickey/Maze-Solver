@@ -1,6 +1,7 @@
 import {
   ChevronDown,
   ChevronUp,
+  Compass,
   Flower2,
   Grid2x2,
   Layers,
@@ -35,6 +36,7 @@ interface FloatingDockProps {
   onScrub: (index: number) => void;
   onToggleSound: () => void;
   onNewMaze: () => void;
+  onResetCamera: () => void;
 }
 
 /** Crisp custom pixel-art botanical sprig emblem (16x16 SVG grid) */
@@ -95,6 +97,7 @@ export function FloatingDock({
   onScrub,
   onToggleSound,
   onNewMaze,
+  onResetCamera,
 }: FloatingDockProps) {
   const maxIdx = Math.max(0, totalFrames - 1);
   const clampedIdx = Math.max(0, Math.min(maxIdx, frameIndex));
@@ -251,6 +254,16 @@ export function FloatingDock({
 
               {/* Mobile-only utility icons right aligned */}
               <div className="flex shrink-0 items-center gap-1 sm:hidden">
+                {viewMode === '2.5d' && (
+                  <button
+                    type="button"
+                    onClick={onResetCamera}
+                    aria-label="Recenter camera view"
+                    className="flex h-8 w-7 items-center justify-center rounded-lg border border-[#1E3A2A]/15 bg-white text-[#294434]"
+                  >
+                    <Compass className="h-3.5 w-3.5" />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={onToggleSound}
@@ -301,8 +314,21 @@ export function FloatingDock({
               </span>
             </div>
 
-            {/* Desktop utility icons: Sound, New Maze, Collapse */}
+            {/* Desktop utility icons: Recenter, Sound, New Maze, Collapse */}
             <div className="hidden shrink-0 items-center gap-1 sm:flex">
+              {viewMode === '2.5d' && (
+                <button
+                  type="button"
+                  data-testid="btn-reset-camera"
+                  onClick={onResetCamera}
+                  title="Recenter view (R)"
+                  aria-label="Recenter camera view"
+                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#1E3A2A]/15 bg-white text-[#294434] transition-colors hover:bg-[#EDF5EC]"
+                >
+                  <Compass className="h-3.5 w-3.5" />
+                </button>
+              )}
+
               <button
                 type="button"
                 data-testid="btn-sound"

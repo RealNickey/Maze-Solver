@@ -50,6 +50,7 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [instantSync, setInstantSync] = useState(true);
   const [interactionNote, setInteractionNote] = useState<string | null>(null);
+  const [resetCameraSeq, setResetCameraSeq] = useState(0);
 
   const noteTimerRef = useRef<number | null>(null);
   const viewTimersRef = useRef<number[]>([]);
@@ -149,7 +150,7 @@ export default function App() {
     if (timelineKind === 'generate') {
       if (frameIndex >= kruskalRun.frames.length - 1) {
         return viewMode === '2.5d'
-          ? 'Drag to orbit · Scroll to zoom · Click meadow to bloom'
+          ? 'Drag to orbit · Right-drag to pan · Scroll to zoom'
           : '2D top-down schematic · Drag S/G · Scrub timeline';
       }
       return `Growing hedgerow · ${frameIndex + 1} / ${kruskalRun.frames.length}`;
@@ -364,6 +365,13 @@ export default function App() {
     triggerHaptic('tap');
   }, []);
 
+  const handleResetCamera = useCallback(() => {
+    setResetCameraSeq((seq) => seq + 1);
+    triggerHaptic('tap');
+    audioEngine.playSoftClick();
+    showInteractionNote('View recentered');
+  }, [showInteractionNote]);
+
   // Animated 2.5D <-> 2D Top camera glide + schematic cross-fade
   const handleChangeViewMode = useCallback(
     (mode: ViewMode) => {
@@ -422,11 +430,20 @@ export default function App() {
         handleChangeViewMode(viewMode === '2.5d' ? '2d' : '2.5d');
       } else if (e.key.toLowerCase() === 'h') {
         setDockCollapsed((prev) => !prev);
+      } else if (e.key.toLowerCase() === 'r' && viewMode === '2.5d') {
+        handleResetCamera();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleTogglePlay, handleStartGenerate, handleStartSolve, handleChangeViewMode, viewMode]);
+  }, [
+    handleTogglePlay,
+    handleStartGenerate,
+    handleStartSolve,
+    handleChangeViewMode,
+    handleResetCamera,
+    viewMode,
+  ]);
 
   return (
     <main
@@ -448,6 +465,7 @@ export default function App() {
         instantSync={instantSync}
         projectionMode={viewMode}
         paused={threePaused}
+        resetCameraSeq={resetCameraSeq}
         onMoveStart={handleMoveStart}
         onMoveGoal={handleMoveGoal}
         onInteractionFeedback={showInteractionNote}
@@ -493,6 +511,7 @@ export default function App() {
         onScrub={handleScrub}
         onToggleSound={handleToggleSound}
         onNewMaze={handleNewMaze}
+        onResetCamera={handleResetCamera}
       />
     </main>
   );

@@ -15,6 +15,7 @@ interface DreamDioramaCanvasProps {
   instantSync: boolean;
   projectionMode: '2.5d' | '2d';
   paused: boolean;
+  resetCameraSeq: number;
   onMoveStart: (cell: CellCoord) => void;
   onMoveGoal: (cell: CellCoord) => void;
   onInteractionFeedback?: (label: string) => void;
@@ -32,6 +33,7 @@ export function DreamDioramaCanvas({
   instantSync,
   projectionMode,
   paused,
+  resetCameraSeq,
   onMoveStart,
   onMoveGoal,
   onInteractionFeedback,
@@ -42,6 +44,7 @@ export function DreamDioramaCanvas({
   const [cameraDragging, setCameraDragging] = useState(false);
   const [cameraOffsetDeg, setCameraOffsetDeg] = useState(0);
   const [cameraZoom, setCameraZoom] = useState(1);
+  const [cameraPan, setCameraPan] = useState({ x: 0, z: 0 });
 
   const callbacksRef = useRef({
     onMoveStart,
@@ -74,10 +77,11 @@ export function DreamDioramaCanvas({
       onMoveStart: (c) => callbacksRef.current.onMoveStart(c),
       onMoveGoal: (c) => callbacksRef.current.onMoveGoal(c),
       onInteractionFeedback: (msg) => callbacksRef.current.onInteractionFeedback?.(msg),
-      onCameraStateChange: (dragging, deg, zoom) => {
+      onCameraStateChange: (dragging, deg, zoom, panX, panZ) => {
         setCameraDragging(dragging);
         setCameraOffsetDeg(deg);
         setCameraZoom(zoom);
+        setCameraPan({ x: panX, z: panZ });
       },
     });
     sceneRef.current = diorama;
@@ -95,6 +99,12 @@ export function DreamDioramaCanvas({
   useEffect(() => {
     sceneRef.current?.setPaused(paused);
   }, [paused]);
+
+  useEffect(() => {
+    if (resetCameraSeq > 0) {
+      sceneRef.current?.resetCamera();
+    }
+  }, [resetCameraSeq]);
 
   useEffect(() => {
     sceneRef.current?.updateState({
@@ -126,9 +136,11 @@ export function DreamDioramaCanvas({
       data-camera-dragging={cameraDragging ? 'true' : 'false'}
       data-camera-azimuth={cameraOffsetDeg}
       data-camera-zoom={cameraZoom}
+      data-camera-pan-x={cameraPan.x}
+      data-camera-pan-z={cameraPan.z}
       className="absolute inset-0 h-full w-full select-none overflow-hidden"
       style={{ cursor: cameraDragging ? 'grabbing' : 'grab' }}
-      aria-label="2.5D dreamy pixel-art botanical maze diorama. Drag to orbit, scroll to zoom, click meadow to bloom flowers, or drag start and goal markers."
+      aria-label="2.5D dreamy pixel-art botanical maze diorama. Drag to orbit, right-drag or Shift-drag to pan freely, scroll to zoom, click meadow to bloom flowers, or drag start and goal markers."
     >
       <div ref={mountRef} className="h-full w-full" />
     </div>

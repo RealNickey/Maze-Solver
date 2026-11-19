@@ -5,6 +5,12 @@ import { buildTileWallMatrix, cellIndex } from '../engine/maze';
 import type { ActivePhase, CellCoord, DsuStepFrame, MazeGrid } from '../engine/types';
 import { audioEngine } from '../utils/audio';
 import { triggerHaptic } from '../utils/haptics';
+import {
+  createBillboardCardGeometry,
+  createBotanicalSprites,
+  createWindSpriteMaterial,
+  type BotanicalSpriteSet,
+} from './botanicalSprites';
 import { createDreamTextures, type DreamTextureSet } from './pixelTextures';
 import {
   createBluebirdGroup,
@@ -35,7 +41,13 @@ export interface DreamSceneCallbacks {
   onMoveStart: (cell: CellCoord) => void;
   onMoveGoal: (cell: CellCoord) => void;
   onInteractionFeedback?: (label: string) => void;
-  onCameraStateChange?: (dragging: boolean, offsetDeg: number, zoom: number) => void;
+  onCameraStateChange?: (
+    dragging: boolean,
+    offsetDeg: number,
+    zoom: number,
+    panX: number,
+    panZ: number
+  ) => void;
 }
 
 interface Particle {
@@ -72,9 +84,8 @@ interface InteractiveBloom {
   z: number;
   scale: number;
   targetScale: number;
-  colorHex: number;
+  species: 0 | 1 | 2; // 0=poppySunburst, 1=marigoldBouquet, 2=peonyStems
   rotY: number;
-  seed: number;
 }
 
 interface LilyPadItem {
@@ -105,15 +116,7 @@ interface ButterflyFlight {
   phase: number;
 }
 
-// Vivid poppy meadow flower palette inspired by sunlit pixel-art wildflower fields
-const FLOWER_PALETTE = [
-  0xff5d73, // Poppy coral-red
-  0xd25bc9, // Orchid magenta
-  0xfacb2e, // Sunflower gold
-  0xff99c8, // Sakura blush pink
-  0x7cc2ff, // Forget-me-not sky
-  0xfffdf5, // Daisy ivory
-];
+const FLOWER_PARTICLE_PALETTE = [0xff5d73, 0xd25bc9, 0xfacb2e, 0xff99c8, 0x3db3ff, 0xfffdf5];
 const LEAF_PALETTE = [0x61c268, 0x77d674, 0x4ca859, 0x95e888];
 
 function detectSoftwareWebGL(): boolean {
@@ -139,10 +142,10 @@ function hashCell(a: number, b: number): number {
 }
 
 /**
- * Builds a plush, rounded-edge pillowy shrub base geometry (zero sharp cube corners!).
+ * Plush rounded-edge pillowy shrub base geometry (zero sharp cube corners).
  */
 function createPillowyShrubGeometry(): THREE.BufferGeometry {
-  const half = 0.37;
+  const half = 0.36;
   const r = 0.19;
   const shape = new THREE.Shape();
   shape.moveTo(-half + r, -half);
@@ -156,15 +159,14 @@ function createPillowyShrubGeometry(): THREE.BufferGeometry {
   shape.quadraticCurveTo(-half, -half, -half + r, -half);
 
   const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: 0.54,
+    depth: 0.48,
     bevelEnabled: true,
-    bevelThickness: 0.16,
+    bevelThickness: 0.15,
     bevelSize: 0.14,
     bevelSegments: 2,
     curveSegments: 4,
   });
 
-  // Rotate so extrusion axis (+Z) becomes vertical (+Y) and rests flush on y = 0
   geo.rotateX(-Math.PI / 2);
   geo.computeBoundingBox();
   if (geo.boundingBox) {
@@ -185,6 +187,7 @@ export class DreamDioramaScene {
   private pmrem: THREE.PMREMGenerator;
   private envRenderTarget: THREE.WebGLRenderTarget;
   private textures: DreamTextureSet;
+  private sprites: BotanicalSpriteSet;
   private keyLight: THREE.DirectionalLight;
 
   // Root groups
@@ -204,25 +207,29 @@ export class DreamDioramaScene {
   private birds: BirdFlight[] = [];
   private butterflies: ButterflyFlight[] = [];
 
+  // Wind-swaying botanical sprite materials (updated each frame with uTime & fog)
+  private windMaterials: THREE.ShaderMaterial[] = [];
+
   // Dynamic per-grid maze instanced meshes
   private tileRows = 0;
   private tileCols = 0;
   private hedgeBaseMesh: THREE.InstancedMesh | null = null;
   private hedgePuffMesh: THREE.InstancedMesh | null = null;
-  private hedgeBudMesh: THREE.InstancedMesh | null = null;
+  private shrubCrownMesh: THREE.InstancedMesh | null = null;
+  private grassFibreMesh: THREE.InstancedMesh | null = null;
+  private pebbleGrassMesh: THREE.InstancedMesh | null = null;
   private mossMesh: THREE.InstancedMesh | null = null;
-  private bfsBudStemMesh: THREE.InstancedMesh | null = null;
-  private bfsBudHeadMesh: THREE.InstancedMesh | null = null;
+  private bfsHydrangeaMesh: THREE.InstancedMesh | null = null;
   private pathVineMesh: THREE.InstancedMesh | null = null;
-  private pathFlowerStemMesh: THREE.InstancedMesh | null = null;
-  private pathFlowerPetalMesh: THREE.InstancedMesh | null = null;
-  private pathFlowerCoreMesh: THREE.InstancedMesh | null = null;
+  private pathPoppyMesh: THREE.InstancedMesh | null = null;
+  private pathMarigoldMesh: THREE.InstancedMesh | null = null;
+  private pathPeonyMesh: THREE.InstancedMesh | null = null;
 
-  // Interactive user-planted + ambient meadow flowers
+  // Interactive user-planted + ambient meadow flower bouquets (3 detailed species!)
   private interactiveBlooms: InteractiveBloom[] = [];
-  private userFlowerStemMesh: THREE.InstancedMesh;
-  private userFlowerPetalMesh: THREE.InstancedMesh;
-  private userFlowerCoreMesh: THREE.InstancedMesh;
+  private userPoppyMesh: THREE.InstancedMesh;
+  private userMarigoldMesh: THREE.InstancedMesh;
+  private userPeonyMesh: THREE.InstancedMesh;
   private readonly maxUserBlooms = 72;
 
   // Per-tile animation buffers
@@ -231,10 +238,8 @@ export class DreamDioramaScene {
   private hedgeWobble: Float32Array = new Float32Array(0);
   private mossTarget: Float32Array = new Float32Array(0);
   private mossScale: Float32Array = new Float32Array(0);
-  private frontierFlags: Uint8Array = new Uint8Array(0);
   private pathTarget: Float32Array = new Float32Array(0);
   private pathScale: Float32Array = new Float32Array(0);
-  private pathOrder: Float32Array = new Float32Array(0);
 
   // FX pools
   private particles: Particle[] = [];
@@ -243,12 +248,14 @@ export class DreamDioramaScene {
   private ripples: RippleRing[] = [];
   private readonly maxRipples = 20;
 
-  // State, camera rig, scroll zoom, & 2.5D <-> 2D morph transition
+  // State, free orbit/pan camera rig (NO snap-back!), zoom, & 2.5D <-> 2D morph
   private state: DreamSceneState;
   private defaultAzimuth = 0;
-  private defaultPolar = 0.64; // Dreamy 2.5D elevated angle
-  private topDownPolar = 0.015; // Overhead aligned angle for 2.5D <-> 2D morph
+  private defaultPolar = 0.64;
+  private topDownPolar = 0.015;
   private defaultDistance = 24;
+  private defaultLookZ = 0.42;
+
   private azimuth = 0;
   private polar = 0.64;
   private targetAzimuth = 0;
@@ -256,18 +263,25 @@ export class DreamDioramaScene {
   private zoomFactor = 1.0;
   private targetZoomFactor = 1.0;
   private camDistance = 24;
-  private lookTarget = new THREE.Vector3(0, 0.15, 0.4);
+  private lookTarget = new THREE.Vector3(0, 0.12, 0.42);
+  private targetLookTarget = new THREE.Vector3(0, 0.12, 0.42);
 
-  // 2.5D <-> 2D transition blend (0 = full 2.5D, 1 = flattened overhead 2D alignment)
+  // Saved 2.5D camera pose when toggling to 2D Top and back
+  private saved25dAzimuth = 0;
+  private saved25dPolar = 0.64;
+  private saved25dZoom = 1.0;
+  private saved25dLook = new THREE.Vector3(0, 0.12, 0.42);
+
   private projectionMode: '2.5d' | '2d' = '2.5d';
   private viewBlend = 0;
   private paused = false;
 
-  // Pointer, pinch-zoom, & dragging
+  // Pointer, free orbit/pan, & two-finger touch pinch/pan
   private pointerDown = false;
-  private dragKind: 'none' | 'camera' | 'start' | 'goal' = 'none';
+  private dragKind: 'none' | 'orbit' | 'pan' | 'start' | 'goal' = 'none';
   private activePointers = new Map<number, { x: number; y: number }>();
   private lastPinchDist: number | null = null;
+  private lastPinchMid: { x: number; y: number } | null = null;
   private lastPointerX = 0;
   private lastPointerY = 0;
   private pointerMovedDist = 0;
@@ -276,9 +290,11 @@ export class DreamDioramaScene {
   private startLift = 0;
   private goalLift = 0;
 
-  // Scratch math objects (zero allocations in animation loop)
+  // Scratch math objects (zero GC allocations in animation loop)
   private readonly scratchObj = new THREE.Object3D();
   private readonly scratchVec = new THREE.Vector3();
+  private readonly scratchRight = new THREE.Vector3();
+  private readonly scratchForward = new THREE.Vector3();
   private readonly scratchColor = new THREE.Color();
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointerNdc = new THREE.Vector2();
@@ -297,6 +313,7 @@ export class DreamDioramaScene {
   private boundPointerMove: (e: PointerEvent) => void;
   private boundPointerUp: (e: PointerEvent) => void;
   private boundWheel: (e: WheelEvent) => void;
+  private boundContextMenu: (e: MouseEvent) => void;
   private boundContextLost: (e: Event) => void;
   private boundContextRestored: () => void;
 
@@ -332,11 +349,12 @@ export class DreamDioramaScene {
     this.renderer.domElement.style.touchAction = 'none';
     this.container.appendChild(this.renderer.domElement);
 
-    // 2. Scene, vibrant pixel cumulus sky backdrop & RoomEnvironment IBL
+    // 2. Scene, pixel cumulus sky backdrop, procedural sprites & RoomEnvironment IBL
     this.scene = new THREE.Scene();
     this.textures = createDreamTextures();
+    this.sprites = createBotanicalSprites();
     this.scene.background = this.textures.skyBackdrop;
-    this.scene.fog = new THREE.Fog(0x9bcdf9, 60, 180);
+    this.scene.fog = new THREE.Fog(0x9bcdf9, 65, 195);
 
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
     this.envRenderTarget = this.pmrem.fromScene(new RoomEnvironment(), 0.04);
@@ -344,9 +362,9 @@ export class DreamDioramaScene {
     this.scene.environmentIntensity = 0.36;
 
     // 3. Camera
-    this.camera = new THREE.PerspectiveCamera(34, width / height, 0.5, 280);
+    this.camera = new THREE.PerspectiveCamera(34, width / height, 0.3, 320);
 
-    // 4. Soft sunlit dreamy lighting (creamy bounce keeps shrubs plush & soft!)
+    // 4. Soft sunlit dreamy lighting
     const hemi = new THREE.HemisphereLight(0xcde7ff, 0x73c962, 1.05);
     this.scene.add(hemi);
 
@@ -363,7 +381,7 @@ export class DreamDioramaScene {
     this.keyLight.shadow.bias = -0.0008;
     this.scene.add(this.keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0xffd4e5, 0.52);
+    const rimLight = new THREE.DirectionalLight(0xffd4e5, 0.5);
     rimLight.position.set(-18, 14, -14);
     this.scene.add(rimLight);
 
@@ -371,8 +389,8 @@ export class DreamDioramaScene {
     this.scene.add(this.worldGroup);
     this.worldGroup.add(this.islandGroup, this.mazeGroup, this.wildlifeGroup, this.fxGroup);
 
-    // 6. Realistic stylized pixel-art Voronoi caustic water plane
-    const waterGeo = new THREE.PlaneGeometry(180, 180);
+    // 6. Realistic organic coastal Voronoi caustic water plane
+    const waterGeo = new THREE.PlaneGeometry(240, 240);
     this.waterMat = createStylizedWaterMaterial(16, 12);
     this.waterMesh = new THREE.Mesh(waterGeo, this.waterMat);
     this.waterMesh.rotation.x = -Math.PI / 2;
@@ -399,30 +417,26 @@ export class DreamDioramaScene {
     this.cursorHalo.visible = false;
     this.fxGroup.add(this.cursorHalo);
 
-    // 9. Interactive user-planted + ambient meadow wildflower instanced meshes
-    const uStemGeo = new THREE.BoxGeometry(0.06, 0.28, 0.06);
-    uStemGeo.translate(0, 0.14, 0);
-    const uStemMat = new THREE.MeshStandardMaterial({ color: 0x45ad4b, roughness: 0.8 });
-    this.userFlowerStemMesh = new THREE.InstancedMesh(uStemGeo, uStemMat, this.maxUserBlooms * 2);
-    this.userFlowerStemMesh.frustumCulled = false;
+    // 9. Interactive & Ambient Meadow Detailed Pixel Flower Bouquets (3 species GPU billboards)
+    const meadowCardGeo = createBillboardCardGeometry(0.96, 0.84);
+    const uPoppyMat = createWindSpriteMaterial(this.sprites.poppySunburst, 0.14, 1.04, 0.36);
+    const uMarigoldMat = createWindSpriteMaterial(this.sprites.marigoldBouquet, 0.14, 1.04, 0.36);
+    const uPeonyMat = createWindSpriteMaterial(this.sprites.peonyStems, 0.17, 1.05, 0.36);
+    this.windMaterials.push(uPoppyMat, uMarigoldMat, uPeonyMat);
 
-    const uPetalGeo = new THREE.BoxGeometry(0.28, 0.09, 0.28);
-    const uPetalMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.42,
-      emissive: 0x1a0c14,
-      emissiveIntensity: 0.08,
-    });
-    this.userFlowerPetalMesh = new THREE.InstancedMesh(uPetalGeo, uPetalMat, this.maxUserBlooms * 2);
-    this.userFlowerPetalMesh.frustumCulled = false;
+    this.userPoppyMesh = new THREE.InstancedMesh(meadowCardGeo, uPoppyMat, this.maxUserBlooms);
+    this.userMarigoldMesh = new THREE.InstancedMesh(
+      meadowCardGeo,
+      uMarigoldMat,
+      this.maxUserBlooms
+    );
+    this.userPeonyMesh = new THREE.InstancedMesh(meadowCardGeo, uPeonyMat, this.maxUserBlooms);
+    this.userPoppyMesh.frustumCulled = false;
+    this.userMarigoldMesh.frustumCulled = false;
+    this.userPeonyMesh.frustumCulled = false;
+    this.fxGroup.add(this.userPoppyMesh, this.userMarigoldMesh, this.userPeonyMesh);
 
-    const uCoreGeo = new THREE.BoxGeometry(0.11, 0.11, 0.11);
-    const uCoreMat = new THREE.MeshStandardMaterial({ color: 0xfde047, roughness: 0.3 });
-    this.userFlowerCoreMesh = new THREE.InstancedMesh(uCoreGeo, uCoreMat, this.maxUserBlooms * 2);
-    this.userFlowerCoreMesh.frustumCulled = false;
-    this.fxGroup.add(this.userFlowerStemMesh, this.userFlowerPetalMesh, this.userFlowerCoreMesh);
-
-    // 10. 3D pixel particle pool
+    // 10. 3D Pixel Particle Pool
     const partGeo = new THREE.BoxGeometry(0.13, 0.13, 0.07);
     const partMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
     this.particleMesh = new THREE.InstancedMesh(partGeo, partMat, this.maxParticles);
@@ -447,7 +461,7 @@ export class DreamDioramaScene {
       });
     }
 
-    // 11. Water & dew ripple pool
+    // 11. Water & Dew Ripple Pool
     const ripGeo = new THREE.RingGeometry(0.32, 0.44, 24);
     for (let i = 0; i < this.maxRipples; i++) {
       const mat = new THREE.MeshBasicMaterial({
@@ -474,17 +488,18 @@ export class DreamDioramaScene {
       });
     }
 
-    // 12. Build grid-dependent island, soft shrubs, & wildlife
+    // 12. Build grid-dependent island, detailed shrubs, grass fibres, flowers & wildlife
     this.rebuildForGrid(initialState.grid);
     this.syncStateToTargets(initialState, true);
-    this.fitCameraForViewport(width, height);
+    this.fitCameraForViewport(width, height, true);
     this.updateCameraTransform();
 
-    // 13. Event listeners
+    // 13. Event listeners (free orbit, free right-drag/shift-drag pan, scroll zoom)
     this.boundPointerDown = this.onPointerDown.bind(this);
     this.boundPointerMove = this.onPointerMove.bind(this);
     this.boundPointerUp = this.onPointerUp.bind(this);
     this.boundWheel = this.onWheel.bind(this);
+    this.boundContextMenu = (e: MouseEvent) => e.preventDefault();
     this.boundContextLost = (e: Event) => {
       e.preventDefault();
       this.contextLost = true;
@@ -497,6 +512,7 @@ export class DreamDioramaScene {
     const dom = this.renderer.domElement;
     dom.addEventListener('pointerdown', this.boundPointerDown);
     dom.addEventListener('wheel', this.boundWheel, { passive: false });
+    dom.addEventListener('contextmenu', this.boundContextMenu);
     window.addEventListener('pointermove', this.boundPointerMove);
     window.addEventListener('pointerup', this.boundPointerUp);
     window.addEventListener('pointercancel', this.boundPointerUp);
@@ -510,7 +526,7 @@ export class DreamDioramaScene {
         this.camera.aspect = w / h;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(w, h);
-        this.fitCameraForViewport(w, h);
+        this.fitCameraForViewport(w, h, false);
         this.updateCameraTransform();
       }
     });
@@ -523,28 +539,43 @@ export class DreamDioramaScene {
   }
 
   /**
-   * Triggers smooth 2.5D <-> 2D top-down morph transition!
+   * Optional recenter back to default 2.5D view (only when explicitly requested by user).
    */
-  public setProjectionMode(mode: '2.5d' | '2d'): void {
-    this.projectionMode = mode;
-    if (mode === '2d') {
-      this.targetAzimuth = 0;
-      this.targetPolar = this.topDownPolar;
-      this.targetZoomFactor = 1.0;
-    } else {
-      this.targetAzimuth = this.defaultAzimuth;
-      this.targetPolar = this.defaultPolar;
-    }
-    this.callbacks.onCameraStateChange?.(
-      false,
-      Math.round(THREE.MathUtils.radToDeg(this.targetAzimuth)),
-      Number(this.targetZoomFactor.toFixed(2))
-    );
+  public resetCamera(): void {
+    this.targetAzimuth = this.defaultAzimuth;
+    this.targetPolar = this.defaultPolar;
+    this.targetZoomFactor = 1.0;
+    this.targetLookTarget.set(0, 0.12, this.defaultLookZ);
+    this.emitCameraTelemetry(false);
   }
 
   /**
-   * Pauses or resumes the Three.js loop (used when completely settled in flat 2D Top view).
+   * Smooth 2.5D <-> 2D top-down morph transition, preserving user's free 2.5D pose when returning!
    */
+  public setProjectionMode(mode: '2.5d' | '2d'): void {
+    if (mode === this.projectionMode) return;
+    this.projectionMode = mode;
+    if (mode === '2d') {
+      // Save user's current free 2.5D orbit/pan/zoom before gliding overhead
+      this.saved25dAzimuth = this.targetAzimuth;
+      this.saved25dPolar = this.targetPolar;
+      this.saved25dZoom = this.targetZoomFactor;
+      this.saved25dLook.copy(this.targetLookTarget);
+
+      this.targetAzimuth = 0;
+      this.targetPolar = this.topDownPolar;
+      this.targetZoomFactor = 1.0;
+      this.targetLookTarget.set(0, 0.12, this.defaultLookZ);
+    } else {
+      // Smoothly return to user's saved 2.5D perspective
+      this.targetAzimuth = this.saved25dAzimuth;
+      this.targetPolar = this.saved25dPolar;
+      this.targetZoomFactor = this.saved25dZoom;
+      this.targetLookTarget.copy(this.saved25dLook);
+    }
+    this.emitCameraTelemetry(false);
+  }
+
   public setPaused(paused: boolean): void {
     if (this.paused === paused) return;
     this.paused = paused;
@@ -568,7 +599,8 @@ export class DreamDioramaScene {
       this.rebuildForGrid(next.grid);
       this.fitCameraForViewport(
         Math.max(this.container.clientWidth, 320),
-        Math.max(this.container.clientHeight, 320)
+        Math.max(this.container.clientHeight, 320),
+        true
       );
     }
 
@@ -589,12 +621,22 @@ export class DreamDioramaScene {
       const newest = next.bfsSnapshot.bloomedPath[nextBloomLen - 1];
       if (newest) {
         const pos = this.cellToWorld(newest);
-        this.spawnParticles(pos.x, 0.38, pos.z, 9, FLOWER_PALETTE, 2.0);
+        this.spawnParticles(pos.x, 0.42, pos.z, 9, FLOWER_PARTICLE_PALETTE, 2.0);
         this.spawnRipple(pos.x, 0.05, pos.z, 1.25, 0xfef08a);
       }
     }
 
     this.syncStateToTargets(next, next.instantSync || dimsChanged);
+  }
+
+  private emitCameraTelemetry(dragging: boolean): void {
+    this.callbacks.onCameraStateChange?.(
+      dragging,
+      Math.round(THREE.MathUtils.radToDeg(this.targetAzimuth)),
+      Number(this.targetZoomFactor.toFixed(2)),
+      Number(this.targetLookTarget.x.toFixed(2)),
+      Number(this.targetLookTarget.z.toFixed(2))
+    );
   }
 
   private tileToWorld(tr: number, tc: number): { x: number; z: number } {
@@ -646,6 +688,9 @@ export class DreamDioramaScene {
     this.tileCols = 2 * grid.cols + 1;
     const totalTiles = this.tileRows * this.tileCols;
 
+    // Keep only persistent user-flower materials in windMaterials before adding new grid sprite mats
+    this.windMaterials = this.windMaterials.slice(0, 3);
+
     this.disposeGroupChildren(this.islandGroup);
     this.disposeGroupChildren(this.mazeGroup);
     this.disposeGroupChildren(this.wildlifeGroup);
@@ -673,7 +718,7 @@ export class DreamDioramaScene {
 
     const plinthTopMat = new THREE.MeshStandardMaterial({
       map: grassTex,
-      roughness: 0.9,
+      roughness: 0.92,
       metalness: 0.0,
     });
     const plinthSideXMat = new THREE.MeshStandardMaterial({
@@ -704,13 +749,12 @@ export class DreamDioramaScene {
     // 2. Four Stone Garden Lanterns on Island Corners
     const lx = padW / 2 - 0.36;
     const lz = padD / 2 - 0.36;
-    const lanternCorners: [number, number][] = [
+    for (const [cx, cz] of [
       [-lx, -lz],
       [lx, -lz],
       [-lx, lz],
       [lx, lz],
-    ];
-    for (const [cx, cz] of lanternCorners) {
+    ] as [number, number][]) {
       const lantern = createGardenLanternGroup();
       lantern.position.set(cx, 0, cz);
       this.islandGroup.add(lantern);
@@ -773,22 +817,21 @@ export class DreamDioramaScene {
       this.islandGroup.add(tree);
     }
 
-    // Charming curved stepping stones in front cove
+    // Front cove stepping stones
     const stepStoneGeo = new THREE.CylinderGeometry(0.42, 0.48, 0.18, 8);
     const stepStoneMat = new THREE.MeshStandardMaterial({ color: 0xf2ece0, roughness: 0.84 });
-    const stepCoords: [number, number][] = [
+    for (const [sx, sz] of [
       [-1.15, halfD + 1.15],
       [0.05, halfD + 1.78],
       [1.28, halfD + 1.28],
-    ];
-    for (const [sx, sz] of stepCoords) {
+    ] as [number, number][]) {
       const stone = new THREE.Mesh(stepStoneGeo, stepStoneMat);
       stone.position.set(sx, -0.56, sz);
       stone.receiveShadow = true;
       this.islandGroup.add(stone);
     }
 
-    // 4. Floating Water Lilies & Poppy Pink Lotuses around the turquoise moat
+    // 4. Floating Water Lilies & Pink Lotuses
     const lilySpots: [number, number, boolean][] = [
       [-halfW - 1.4, -halfD + 2.4, true],
       [-halfW - 1.9, 2.8, false],
@@ -817,7 +860,7 @@ export class DreamDioramaScene {
       });
     });
 
-    // 5. SOFT, PILLOWY Rounded Maze Shrub Instanced Meshes (velvety matte finish, zero sharp highlights!)
+    // 5. DETAILED SOFT SHRUBS (Pillowy Base + Velvety Puff + Feathery Pixel Leafy Crown Sprigs!)
     const shrubBaseGeo = createPillowyShrubGeometry();
     const shrubBaseMat = new THREE.MeshStandardMaterial({
       map: this.textures.shrubSoft,
@@ -830,10 +873,9 @@ export class DreamDioramaScene {
     this.hedgeBaseMesh.receiveShadow = true;
     this.hedgeBaseMesh.frustumCulled = false;
 
-    // Soft organic crown bush puffs nestled on top of every shrub tile
-    const puffGeo = new THREE.IcosahedronGeometry(0.43, 1);
-    puffGeo.scale(1.16, 0.52, 1.16);
-    puffGeo.translate(0, 0.82, 0);
+    const puffGeo = new THREE.IcosahedronGeometry(0.42, 1);
+    puffGeo.scale(1.15, 0.52, 1.15);
+    puffGeo.translate(0, 0.78, 0);
     const puffMat = new THREE.MeshStandardMaterial({
       map: this.textures.shrubSoft,
       color: 0xeefce9,
@@ -845,96 +887,85 @@ export class DreamDioramaScene {
     this.hedgePuffMesh.receiveShadow = true;
     this.hedgePuffMesh.frustumCulled = false;
 
-    // Tiny poppy pastel blossom accents nestled on ~35% of soft shrub tops
-    const shrubBudGeo = new THREE.BoxGeometry(0.14, 0.1, 0.14);
-    const shrubBudMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.45,
-      emissive: 0x221018,
-      emissiveIntensity: 0.12,
-    });
-    this.hedgeBudMesh = new THREE.InstancedMesh(shrubBudGeo, shrubBudMat, totalTiles);
-    this.hedgeBudMesh.frustumCulled = false;
+    // Intricate pixel-art leafy foliage sprigs & micro-buds swaying atop EVERY shrub (GPU billboard)!
+    const shrubCrownGeo = createBillboardCardGeometry(1.18, 0.8);
+    const shrubCrownMat = createWindSpriteMaterial(this.sprites.shrubCrown, 0.11, 1.03, 0.44);
+    this.windMaterials.push(shrubCrownMat);
+    this.shrubCrownMesh = new THREE.InstancedMesh(shrubCrownGeo, shrubCrownMat, totalTiles);
+    this.shrubCrownMesh.frustumCulled = false;
 
-    // BFS Living Mint-Dew Moss Carpet
-    const mossGeo = new THREE.BoxGeometry(0.94, 0.06, 0.94);
-    mossGeo.translate(0, 0.03, 0);
+    // 6. SWAYING GRASS FIBRES (3 lush arching grass-blade tufts per open meadow tile!)
+    const grassFibreGeo = createBillboardCardGeometry(0.56, 0.44);
+    const grassFibreMat = createWindSpriteMaterial(this.sprites.grassFibres, 0.24, 1.04, 0.34);
+    this.windMaterials.push(grassFibreMat);
+    this.grassFibreMesh = new THREE.InstancedMesh(grassFibreGeo, grassFibreMat, totalTiles * 3);
+    this.grassFibreMesh.frustumCulled = false;
+
+    // 7. MOSSY PEBBLE & ARCHING GRASS TUFTS (Reference #2 scattered in open garden spots!)
+    const pebbleGeo = createBillboardCardGeometry(0.76, 0.58);
+    const pebbleMat = createWindSpriteMaterial(this.sprites.pebbleGrass, 0.12, 1.02, 0.36);
+    this.windMaterials.push(pebbleMat);
+    this.pebbleGrassMesh = new THREE.InstancedMesh(pebbleGeo, pebbleMat, totalTiles);
+    this.pebbleGrassMesh.frustumCulled = false;
+
+    // 8. BFS LIVING FOLIAGE WAVE: Vibrant Cobalt-Sapphire Dew Carpet + Bold Blue Hydrangea Clusters (Ref #1!)
+    const mossGeo = new THREE.BoxGeometry(0.98, 0.09, 0.98);
+    mossGeo.translate(0, 0.045, 0);
     const mossMat = new THREE.MeshStandardMaterial({
       map: this.textures.mossPath,
+      emissive: 0x1d4ed8,
+      emissiveIntensity: 0.24,
       roughness: 0.72,
-      metalness: 0.02,
+      metalness: 0.0,
     });
     this.mossMesh = new THREE.InstancedMesh(mossGeo, mossMat, totalTiles);
     this.mossMesh.receiveShadow = true;
     this.mossMesh.frustumCulled = false;
 
-    // BFS Forget-me-not Sky-Blue Dew Buds
-    const budStemGeo = new THREE.BoxGeometry(0.07, 0.24, 0.07);
-    budStemGeo.translate(0, 0.12, 0);
-    const budStemMat = new THREE.MeshStandardMaterial({ color: 0x2fa067, roughness: 0.8 });
-    this.bfsBudStemMesh = new THREE.InstancedMesh(budStemGeo, budStemMat, totalTiles);
-    this.bfsBudStemMesh.frustumCulled = false;
+    const hydrangeaGeo = createBillboardCardGeometry(1.06, 0.88);
+    const hydrangeaMat = createWindSpriteMaterial(this.sprites.blueHydrangea, 0.14, 1.08, 0.38);
+    this.windMaterials.push(hydrangeaMat);
+    this.bfsHydrangeaMesh = new THREE.InstancedMesh(hydrangeaGeo, hydrangeaMat, totalTiles);
+    this.bfsHydrangeaMesh.frustumCulled = false;
 
-    const budHeadGeo = new THREE.BoxGeometry(0.22, 0.16, 0.22);
-    budHeadGeo.translate(0, 0.26, 0);
-    const budHeadMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.35,
-      emissive: 0x38bdf8,
-      emissiveIntensity: 0.25,
-    });
-    this.bfsBudHeadMesh = new THREE.InstancedMesh(budHeadGeo, budHeadMat, totalTiles);
-    this.bfsBudHeadMesh.frustumCulled = false;
-
-    // Shortest Path Living Vines + Bold Poppy Multi-Bloom Wildflowers (3 per path tile)
-    const vineGeo = new THREE.BoxGeometry(0.92, 0.14, 0.92);
-    vineGeo.translate(0, 0.07, 0);
+    // 9. OPTIMAL SHORTEST PATH: Radiant Sunlit Golden-Amber Petal Highway + Tall Vibrant Wildflower Bouquets!
+    const vineGeo = new THREE.BoxGeometry(0.96, 0.18, 0.96);
+    vineGeo.translate(0, 0.09, 0);
     const vineMat = new THREE.MeshStandardMaterial({
-      color: 0x38c765,
-      roughness: 0.68,
-      emissive: 0x166534,
-      emissiveIntensity: 0.16,
+      map: this.textures.goldPath,
+      roughness: 0.58,
+      metalness: 0.04,
+      emissive: 0xea580c,
+      emissiveIntensity: 0.36,
     });
     this.pathVineMesh = new THREE.InstancedMesh(vineGeo, vineMat, totalTiles);
     this.pathVineMesh.frustumCulled = false;
 
-    const pStemGeo = new THREE.BoxGeometry(0.08, 0.42, 0.08);
-    pStemGeo.translate(0, 0.21, 0);
-    const pStemMat = new THREE.MeshStandardMaterial({ color: 0x2d9946, roughness: 0.78 });
-    this.pathFlowerStemMesh = new THREE.InstancedMesh(pStemGeo, pStemMat, totalTiles * 3);
-    this.pathFlowerStemMesh.frustumCulled = false;
+    const pathFlowerGeo = createBillboardCardGeometry(1.26, 1.12);
+    const pPoppyMat = createWindSpriteMaterial(this.sprites.poppySunburst, 0.18, 1.1, 0.4);
+    const pMarigoldMat = createWindSpriteMaterial(this.sprites.marigoldBouquet, 0.16, 1.1, 0.4);
+    const pPeonyMat = createWindSpriteMaterial(this.sprites.peonyStems, 0.21, 1.12, 0.4);
+    this.windMaterials.push(pPoppyMat, pMarigoldMat, pPeonyMat);
 
-    const pPetalGeo = new THREE.BoxGeometry(0.4, 0.14, 0.4);
-    const pPetalMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.38,
-      emissive: 0x241016,
-      emissiveIntensity: 0.14,
-    });
-    this.pathFlowerPetalMesh = new THREE.InstancedMesh(pPetalGeo, pPetalMat, totalTiles * 3);
-    this.pathFlowerPetalMesh.frustumCulled = false;
-
-    const pCoreGeo = new THREE.BoxGeometry(0.16, 0.17, 0.16);
-    const pCoreMat = new THREE.MeshStandardMaterial({
-      color: 0xfde047,
-      roughness: 0.26,
-      emissive: 0xca8a04,
-      emissiveIntensity: 0.28,
-    });
-    this.pathFlowerCoreMesh = new THREE.InstancedMesh(pCoreGeo, pCoreMat, totalTiles * 3);
-    this.pathFlowerCoreMesh.frustumCulled = false;
+    this.pathPoppyMesh = new THREE.InstancedMesh(pathFlowerGeo, pPoppyMat, totalTiles);
+    this.pathMarigoldMesh = new THREE.InstancedMesh(pathFlowerGeo, pMarigoldMat, totalTiles);
+    this.pathPeonyMesh = new THREE.InstancedMesh(pathFlowerGeo, pPeonyMat, totalTiles);
+    this.pathPoppyMesh.frustumCulled = false;
+    this.pathMarigoldMesh.frustumCulled = false;
+    this.pathPeonyMesh.frustumCulled = false;
 
     this.mazeGroup.add(
       this.hedgeBaseMesh,
       this.hedgePuffMesh,
-      this.hedgeBudMesh,
+      this.shrubCrownMesh,
+      this.grassFibreMesh,
+      this.pebbleGrassMesh,
       this.mossMesh,
-      this.bfsBudStemMesh,
-      this.bfsBudHeadMesh,
+      this.bfsHydrangeaMesh,
       this.pathVineMesh,
-      this.pathFlowerStemMesh,
-      this.pathFlowerPetalMesh,
-      this.pathFlowerCoreMesh
+      this.pathPoppyMesh,
+      this.pathMarigoldMesh,
+      this.pathPeonyMesh
     );
 
     // Initialize tile animation buffers
@@ -943,12 +974,10 @@ export class DreamDioramaScene {
     this.hedgeWobble = new Float32Array(totalTiles);
     this.mossTarget = new Float32Array(totalTiles);
     this.mossScale = new Float32Array(totalTiles);
-    this.frontierFlags = new Uint8Array(totalTiles);
     this.pathTarget = new Float32Array(totalTiles);
     this.pathScale = new Float32Array(totalTiles);
-    this.pathOrder = new Float32Array(totalTiles);
 
-    // Soft velvety sage-emerald harmonies across shrubs (slightly richer than bright meadow grass for clear maze reading!)
+    // Soft sage-emerald color harmonies across pillowy shrub bases & puffs
     for (let i = 0; i < totalTiles; i++) {
       const tr = Math.floor(i / this.tileCols);
       const tc = i % this.tileCols;
@@ -957,22 +986,16 @@ export class DreamDioramaScene {
       this.hedgeBaseMesh.setColorAt(i, this.scratchColor);
       this.scratchColor.setRGB(0.84 + h * 0.12, 0.96 + h * 0.06, 0.82 + h * 0.1);
       this.hedgePuffMesh.setColorAt(i, this.scratchColor);
-
-      const budCol = FLOWER_PALETTE[Math.floor(h * FLOWER_PALETTE.length)];
-      this.scratchColor.setHex(budCol);
-      this.hedgeBudMesh.setColorAt(i, this.scratchColor);
     }
     if (this.hedgeBaseMesh.instanceColor) this.hedgeBaseMesh.instanceColor.needsUpdate = true;
     if (this.hedgePuffMesh.instanceColor) this.hedgePuffMesh.instanceColor.needsUpdate = true;
-    if (this.hedgeBudMesh.instanceColor) this.hedgeBudMesh.instanceColor.needsUpdate = true;
 
-    // 6. Gliding Articulated Bluebirds (3)
-    const birdSpecs = [
+    // 10. Gliding Articulated Bluebirds (3)
+    for (const bs of [
       { rx: halfW * 0.72, rz: halfD * 0.68, y: 3.1, speed: 0.42, phase: 0.4 },
       { rx: halfW * 0.92, rz: halfD * 0.52, y: 3.85, speed: -0.34, phase: 2.6 },
       { rx: halfW * 0.56, rz: halfD * 0.88, y: 2.75, speed: 0.5, phase: 4.5 },
-    ];
-    for (const bs of birdSpecs) {
+    ]) {
       const bird = createBluebirdGroup();
       this.wildlifeGroup.add(bird.group);
       this.birds.push({
@@ -986,7 +1009,7 @@ export class DreamDioramaScene {
       });
     }
 
-    // 7. Fluttering Poppy Pastel Butterflies (4)
+    // 11. Fluttering Poppy Pastel Butterflies (4)
     const bfColors = [0xfde047, 0xff7eb6, 0x7cc2ff, 0xd884fc];
     for (let i = 0; i < 4; i++) {
       const bf = createButterflyGroup(bfColors[i]);
@@ -1004,21 +1027,20 @@ export class DreamDioramaScene {
       });
     }
 
-    // 8. Seed vibrant poppy meadow wildflowers across open chambers (like reference image 2!)
-    const seedCount = Math.min(22, Math.floor((grid.rows * grid.cols) / 6));
+    // 12. Pre-seed charming detailed pixel flower bouquets in open chambers
+    const seedCount = Math.min(20, Math.floor((grid.rows * grid.cols) / 7));
     for (let i = 0; i < seedCount; i++) {
       const r = Math.floor(hashCell(i, 17) * grid.rows);
       const c = Math.floor(hashCell(i, 31) * grid.cols);
       if ((r === 0 && c === 0) || (r === grid.rows - 1 && c === grid.cols - 1)) continue;
       const p = this.cellToWorld({ row: r, col: c });
       this.interactiveBlooms.push({
-        x: p.x + (hashCell(i, 41) - 0.5) * 0.44,
-        z: p.z + (hashCell(i, 43) - 0.5) * 0.44,
-        scale: 1,
-        targetScale: 1,
-        colorHex: FLOWER_PALETTE[i % FLOWER_PALETTE.length],
+        x: p.x + (hashCell(i, 41) - 0.5) * 0.32,
+        z: p.z + (hashCell(i, 43) - 0.5) * 0.32,
+        scale: 0.85,
+        targetScale: 0.85,
+        species: (i % 3) as 0 | 1 | 2,
         rotY: hashCell(i, 53) * Math.PI * 2,
-        seed: i * 1.3,
       });
     }
   }
@@ -1028,9 +1050,7 @@ export class DreamDioramaScene {
     const total = this.tileRows * this.tileCols;
 
     this.mossTarget.fill(0);
-    this.frontierFlags.fill(0);
     this.pathTarget.fill(0);
-    this.pathOrder.fill(0);
 
     for (let tr = 0; tr < this.tileRows; tr++) {
       for (let tc = 0; tc < this.tileCols; tc++) {
@@ -1053,18 +1073,13 @@ export class DreamDioramaScene {
         const tc = 2 * c + 1;
         const tileIdx = tr * this.tileCols + tc;
         this.mossTarget[tileIdx] = 1;
-        if (snap.frontierSet.has(cIdx) || snap.currentCellIdx === cIdx) {
-          this.frontierFlags[tileIdx] = 1;
-        }
 
         const w = st.grid.walls[cIdx];
         if (!w.east && c + 1 < cols && snap.visitedDistances.has(cellIndex(r, c + 1, cols))) {
-          const bridgeIdx = tr * this.tileCols + (tc + 1);
-          this.mossTarget[bridgeIdx] = 1;
+          this.mossTarget[tr * this.tileCols + (tc + 1)] = 1;
         }
         if (!w.south && r + 1 < st.grid.rows && snap.visitedDistances.has(cellIndex(r + 1, c, cols))) {
-          const bridgeIdx = (tr + 1) * this.tileCols + tc;
-          this.mossTarget[bridgeIdx] = 1;
+          this.mossTarget[(tr + 1) * this.tileCols + tc] = 1;
         }
       }
 
@@ -1073,17 +1088,13 @@ export class DreamDioramaScene {
         const cell = path[i];
         const tr = 2 * cell.row + 1;
         const tc = 2 * cell.col + 1;
-        const tileIdx = tr * this.tileCols + tc;
-        this.pathTarget[tileIdx] = 1;
-        this.pathOrder[tileIdx] = i / Math.max(1, path.length - 1);
+        this.pathTarget[tr * this.tileCols + tc] = 1;
 
         if (i + 1 < path.length) {
           const next = path[i + 1];
           const bTr = tr + (next.row - cell.row);
           const bTc = tc + (next.col - cell.col);
-          const bIdx = bTr * this.tileCols + bTc;
-          this.pathTarget[bIdx] = 1;
-          this.pathOrder[bIdx] = (i + 0.5) / Math.max(1, path.length - 1);
+          this.pathTarget[bTr * this.tileCols + bTc] = 1;
         }
       }
     }
@@ -1102,7 +1113,7 @@ export class DreamDioramaScene {
     this.goalShrine.position.set(gPos.x, this.goalLift, gPos.z);
   }
 
-  private fitCameraForViewport(width: number, height: number): void {
+  private fitCameraForViewport(width: number, height: number, resetLook: boolean): void {
     const aspect = width / height;
     const isPortrait = aspect < 0.85;
     const targetFov = isPortrait ? 44 : 34;
@@ -1119,19 +1130,29 @@ export class DreamDioramaScene {
     const distForW = (islandW * 0.56) / Math.tan(hFovRad / 2);
     this.defaultDistance = Math.max(distForH, distForW, 17);
     this.camDistance = this.defaultDistance * this.zoomFactor;
+    this.defaultLookZ = isPortrait ? 0.2 : 0.42;
 
-    this.camera.far = Math.max(260, this.defaultDistance * 8);
+    this.camera.far = Math.max(300, this.defaultDistance * 10);
     this.camera.updateProjectionMatrix();
     this.updateFogForDistance();
 
-    this.lookTarget.set(0, 0.1, isPortrait ? 0.2 : 0.42);
+    if (resetLook) {
+      this.lookTarget.set(0, 0.12, this.defaultLookZ);
+      this.targetLookTarget.set(0, 0.12, this.defaultLookZ);
+    }
   }
 
   private updateFogForDistance(): void {
+    const refDist = Math.max(this.defaultDistance, this.camDistance);
+    const fNear = refDist * 2.1;
+    const fFar = refDist * 5.2;
     if (this.scene.fog instanceof THREE.Fog) {
-      const refDist = Math.max(this.defaultDistance, this.camDistance);
-      this.scene.fog.near = refDist * 2.0;
-      this.scene.fog.far = refDist * 4.8;
+      this.scene.fog.near = fNear;
+      this.scene.fog.far = fFar;
+    }
+    for (const mat of this.windMaterials) {
+      mat.uniforms.uFogNear.value = fNear;
+      mat.uniforms.uFogFar.value = fFar;
     }
   }
 
@@ -1203,15 +1224,14 @@ export class DreamDioramaScene {
   }
 
   private plantInteractiveFlower(x: number, z: number): void {
-    const colorHex = FLOWER_PALETTE[Math.floor(Math.random() * FLOWER_PALETTE.length)];
+    const species = Math.floor(Math.random() * 3) as 0 | 1 | 2;
     const bloom: InteractiveBloom = {
       x,
       z,
       scale: 0.05,
-      targetScale: 1.05 + Math.random() * 0.28,
-      colorHex,
+      targetScale: 0.92 + Math.random() * 0.26,
+      species,
       rotY: Math.random() * Math.PI * 2,
-      seed: Math.random() * 10,
     };
     if (this.interactiveBlooms.length >= this.maxUserBlooms) {
       this.interactiveBlooms.shift();
@@ -1231,26 +1251,39 @@ export class DreamDioramaScene {
     return hit ? hit.clone() : null;
   }
 
+  private applyPanDelta(dxPx: number, dyPx: number): void {
+    // Pan along the horizontal ground plane matching current camera yaw
+    const panScale = this.camDistance * 0.00145;
+    const cosA = Math.cos(this.azimuth);
+    const sinA = Math.sin(this.azimuth);
+    this.scratchRight.set(cosA, 0, -sinA);
+    this.scratchForward.set(-sinA, 0, -cosA);
+
+    this.targetLookTarget.addScaledVector(this.scratchRight, -dxPx * panScale);
+    this.targetLookTarget.addScaledVector(this.scratchForward, dyPx * panScale);
+
+    // Generous free-pan bounds across the whole ocean archipelago
+    this.targetLookTarget.x = THREE.MathUtils.clamp(this.targetLookTarget.x, -36, 36);
+    this.targetLookTarget.z = THREE.MathUtils.clamp(this.targetLookTarget.z, -36, 36);
+  }
+
   private onWheel(e: WheelEvent): void {
     if (this.projectionMode !== '2.5d') return;
     e.preventDefault();
-    const step = Math.sign(e.deltaY) * Math.min(0.14, Math.abs(e.deltaY) * 0.0012);
-    this.targetZoomFactor = THREE.MathUtils.clamp(this.targetZoomFactor + step, 0.48, 1.6);
-    this.callbacks.onCameraStateChange?.(
-      this.dragKind === 'camera' && this.pointerDown,
-      Math.round(THREE.MathUtils.radToDeg(this.targetAzimuth)),
-      Number(this.targetZoomFactor.toFixed(2))
-    );
+    const step = Math.sign(e.deltaY) * Math.min(0.16, Math.abs(e.deltaY) * 0.0013);
+    // Wide zoom range: 0.22x (macro inside swaying grass & flowers) -> 2.25x (high above the drifting clouds!)
+    this.targetZoomFactor = THREE.MathUtils.clamp(this.targetZoomFactor + step, 0.22, 2.25);
+    this.emitCameraTelemetry(this.pointerDown && (this.dragKind === 'orbit' || this.dragKind === 'pan'));
   }
 
   private onPointerDown(e: PointerEvent): void {
     if (this.projectionMode !== '2.5d') return;
-    if (e.button !== 0 && e.pointerType === 'mouse') return;
 
     this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (this.activePointers.size === 2) {
       const pts = Array.from(this.activePointers.values());
       this.lastPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      this.lastPinchMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
       this.dragKind = 'none';
       return;
     }
@@ -1261,6 +1294,15 @@ export class DreamDioramaScene {
     this.lastPointerY = e.clientY;
     this.pointerMovedDist = 0;
 
+    // Right-click, Middle-click, or Shift+Left-click -> Free Camera Pan!
+    if (e.button === 2 || e.button === 1 || (e.button === 0 && e.shiftKey)) {
+      this.dragKind = 'pan';
+      return;
+    }
+
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+
+    // Check if clicking Start Nest or Goal Shrine to drag them
     const hitGround = this.intersectPlane(this.groundPlane);
     if (hitGround) {
       const sDist = Math.hypot(
@@ -1285,30 +1327,32 @@ export class DreamDioramaScene {
       }
     }
 
-    this.dragKind = 'camera';
+    // Free 360° orbit drag (NO snap-back on release!)
+    this.dragKind = 'orbit';
   }
 
   private onPointerMove(e: PointerEvent): void {
     if (this.projectionMode !== '2.5d') return;
 
-    // Two-finger pinch zoom on touch devices
+    // Two-finger touch pinch-zoom + two-finger pan
     if (this.activePointers.has(e.pointerId)) {
       this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size === 2 && this.lastPinchDist !== null) {
+      if (this.activePointers.size === 2 && this.lastPinchDist !== null && this.lastPinchMid) {
         const pts = Array.from(this.activePointers.values());
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        const delta = this.lastPinchDist - dist;
-        this.lastPinchDist = dist;
+        const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+
+        const pinchDelta = this.lastPinchDist - dist;
         this.targetZoomFactor = THREE.MathUtils.clamp(
-          this.targetZoomFactor + delta * 0.003,
-          0.48,
-          1.6
+          this.targetZoomFactor + pinchDelta * 0.0032,
+          0.22,
+          2.25
         );
-        this.callbacks.onCameraStateChange?.(
-          false,
-          Math.round(THREE.MathUtils.radToDeg(this.targetAzimuth)),
-          Number(this.targetZoomFactor.toFixed(2))
-        );
+        this.applyPanDelta(mid.x - this.lastPinchMid.x, mid.y - this.lastPinchMid.y);
+
+        this.lastPinchDist = dist;
+        this.lastPinchMid = mid;
+        this.emitCameraTelemetry(true);
         return;
       }
     }
@@ -1322,23 +1366,20 @@ export class DreamDioramaScene {
       this.lastPointerY = e.clientY;
       this.pointerMovedDist += Math.hypot(dx, dy);
 
-      if (this.dragKind === 'camera') {
-        this.targetAzimuth = THREE.MathUtils.clamp(
-          this.targetAzimuth - dx * 0.0068,
-          -1.08,
-          1.08
-        );
-        this.targetPolar = THREE.MathUtils.clamp(
-          this.targetPolar - dy * 0.0052,
-          0.32,
-          1.12
-        );
-        if (this.pointerMovedDist > 6) {
-          this.callbacks.onCameraStateChange?.(
-            true,
-            Math.round(THREE.MathUtils.radToDeg(this.targetAzimuth)),
-            Number(this.targetZoomFactor.toFixed(2))
-          );
+      if (this.dragKind === 'orbit') {
+        // Free 360° orbit + generous tilt down to eye-level in the flowers!
+        this.targetAzimuth -= dx * 0.0068;
+        this.targetPolar = THREE.MathUtils.clamp(this.targetPolar - dy * 0.0054, 0.16, 1.32);
+        if (this.pointerMovedDist > 5) {
+          this.emitCameraTelemetry(true);
+        }
+        return;
+      }
+
+      if (this.dragKind === 'pan') {
+        this.applyPanDelta(dx, dy);
+        if (this.pointerMovedDist > 3) {
+          this.emitCameraTelemetry(true);
         }
         return;
       }
@@ -1402,6 +1443,7 @@ export class DreamDioramaScene {
     this.activePointers.delete(e.pointerId);
     if (this.activePointers.size < 2) {
       this.lastPinchDist = null;
+      this.lastPinchMid = null;
     }
 
     if (!this.pointerDown) return;
@@ -1416,14 +1458,12 @@ export class DreamDioramaScene {
       audioEngine.playInteractiveBloom();
     }
 
-    // Spring-back camera lock on release (preserves user scroll zoom!)
-    if (kind === 'camera' && this.projectionMode === '2.5d') {
-      this.targetAzimuth = this.defaultAzimuth;
-      this.targetPolar = this.defaultPolar;
-      this.callbacks.onCameraStateChange?.(false, 0, Number(this.targetZoomFactor.toFixed(2)));
+    // NO SNAP-BACK! Camera stays freely wherever the user orbited or panned it!
+    if (kind === 'orbit' || kind === 'pan') {
+      this.emitCameraTelemetry(false);
     }
 
-    if (wasClick && kind === 'camera' && this.projectionMode === '2.5d') {
+    if (wasClick && kind === 'orbit' && this.projectionMode === '2.5d') {
       this.handleSceneClick(e);
     }
   }
@@ -1431,7 +1471,7 @@ export class DreamDioramaScene {
   private handleSceneClick(e: PointerEvent): void {
     this.setPointerNdc(e);
 
-    // 1. Clicking near a gliding bluebird
+    // 1. Bluebird interaction
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
     for (const bf of this.birds) {
       const dist = this.raycaster.ray.distanceToPoint(bf.bird.group.position);
@@ -1452,7 +1492,7 @@ export class DreamDioramaScene {
       }
     }
 
-    // 2. Clicking garden tile (open meadow -> bloom wildflower; soft shrub -> bounce + leaves)
+    // 2. Meadow flower planting or soft shrub shake
     const hitGround = this.intersectPlane(this.groundPlane);
     if (hitGround) {
       const tile = this.worldToTile(hitGround.x, hitGround.z);
@@ -1468,17 +1508,17 @@ export class DreamDioramaScene {
           return;
         } else {
           this.plantInteractiveFlower(hitGround.x, hitGround.z);
-          this.spawnParticles(hitGround.x, 0.25, hitGround.z, 12, FLOWER_PALETTE, 2.0);
+          this.spawnParticles(hitGround.x, 0.3, hitGround.z, 12, FLOWER_PARTICLE_PALETTE, 2.0);
           this.spawnRipple(hitGround.x, 0.05, hitGround.z, 1.4, 0xfef08a);
           audioEngine.playInteractiveBloom();
           triggerHaptic('bloom');
-          this.callbacks.onInteractionFeedback?.('Poppy wildflowers bloomed in the meadow');
+          this.callbacks.onInteractionFeedback?.('Wildflower bouquet bloomed in the meadow');
           return;
         }
       }
     }
 
-    // 3. Clicking floating water lilies or open turquoise caustic water
+    // 3. Water lily or coastal caustic water ripple
     const hitWater = this.intersectPlane(this.waterPlane);
     if (hitWater) {
       for (const pad of this.lilyPads) {
@@ -1509,30 +1549,25 @@ export class DreamDioramaScene {
     this.elapsed += dt;
     const t = this.elapsed;
 
-    // 1. Smooth 2.5D <-> 2D morph blend, orbit spring-back, and scroll zoom damping
+    // 1. Smooth damped free camera (orbit, pan, zoom) + 2.5D <-> 2D morph blend
     const blendTarget = this.projectionMode === '2d' ? 1 : 0;
     this.viewBlend += (blendTarget - this.viewBlend) * (1 - Math.exp(-8.5 * dt));
 
-    const camLerp = this.dragKind === 'camera' ? 1 - Math.exp(-16 * dt) : 1 - Math.exp(-8.0 * dt);
+    const camLerp = 1 - Math.exp(-13 * dt);
     this.azimuth += (this.targetAzimuth - this.azimuth) * camLerp;
     this.polar += (this.targetPolar - this.polar) * camLerp;
     this.zoomFactor += (this.targetZoomFactor - this.zoomFactor) * (1 - Math.exp(-11 * dt));
-
-    if (this.dragKind !== 'camera' && this.projectionMode === '2.5d') {
-      if (Math.abs(this.azimuth - this.defaultAzimuth) < 0.001) {
-        this.azimuth = this.defaultAzimuth;
-      }
-      if (Math.abs(this.polar - this.defaultPolar) < 0.001) {
-        this.polar = this.defaultPolar;
-      }
-    }
+    this.lookTarget.lerp(this.targetLookTarget, camLerp);
 
     this.camDistance = this.defaultDistance * this.zoomFactor;
     this.updateFogForDistance();
     this.updateCameraTransform();
 
-    // 2. Animate Realistic Pixel Voronoi Caustic Water Shader
+    // 2. Update Realistic Coastal Water & GPU Wind-Swaying Botanical Shaders
     this.waterMat.uniforms.uTime.value = t;
+    for (const mat of this.windMaterials) {
+      mat.uniforms.uTime.value = t;
+    }
 
     // 3. Bobbing Water Lilies
     for (const pad of this.lilyPads) {
@@ -1544,7 +1579,7 @@ export class DreamDioramaScene {
       pad.group.rotation.z = Math.sin(t * 1.4 + pad.phase) * 0.05;
     }
 
-    // 4. Start Nest & Goal Sun Shrine living animations
+    // 5. Start Nest & Goal Sun Shrine animations
     const targetStartLift = this.dragKind === 'start' ? 0.45 : 0;
     const targetGoalLift = this.dragKind === 'goal' ? 0.45 : 0;
     this.startLift += (targetStartLift - this.startLift) * Math.min(1, dt * 14);
@@ -1566,30 +1601,38 @@ export class DreamDioramaScene {
       goalHalo.scale.setScalar(1 + Math.cos(t * 2.6) * 0.06 + this.goalLift * 0.4);
     }
 
-    // 5. Update Soft Pillowy Shrubs, BFS Moss/Buds, and Poppy Blooming Wildflowers
+    // 6. Update Detailed Shrubs, Swaying Grass Fibres, Pebble Tufts, BFS Blue Hydrangeas & Multi-Species Path Bouquets!
     const total = this.tileRows * this.tileCols;
     const growthRate = Math.min(1, dt * 12);
-    // Gently flatten shrubs vertically during 2.5D -> 2D morph for seamless transition
     const morphHeightMul = 1.0 - this.viewBlend * 0.72;
 
     if (
       this.hedgeBaseMesh &&
       this.hedgePuffMesh &&
-      this.hedgeBudMesh &&
+      this.shrubCrownMesh &&
+      this.grassFibreMesh &&
+      this.pebbleGrassMesh &&
       this.mossMesh &&
-      this.bfsBudStemMesh &&
-      this.bfsBudHeadMesh &&
+      this.bfsHydrangeaMesh &&
       this.pathVineMesh &&
-      this.pathFlowerStemMesh &&
-      this.pathFlowerPetalMesh &&
-      this.pathFlowerCoreMesh
+      this.pathPoppyMesh &&
+      this.pathMarigoldMesh &&
+      this.pathPeonyMesh
     ) {
       for (let i = 0; i < total; i++) {
         const tr = Math.floor(i / this.tileCols);
         const tc = i % this.tileCols;
         const wx = tc - (this.tileCols - 1) / 2;
         const wz = tr - (this.tileRows - 1) / 2;
+        const hRand = hashCell(tr, tc);
+        const hRand2 = hashCell(tc + 7, tr + 13);
 
+        // Rolling spatial wind wave across the island!
+        const windWave =
+          Math.sin(t * 2.15 + wx * 0.36 + wz * 0.27) * 0.036 +
+          Math.sin(t * 4.1 + wx * 0.85 - wz * 0.55) * 0.014;
+
+        // A. Detailed Soft Shrubs
         const targetH = this.wallClosedFlags[i];
         this.hedgeScale[i] += (targetH - this.hedgeScale[i]) * growthRate;
         if (this.hedgeWobble[i] > 0.001) {
@@ -1600,13 +1643,11 @@ export class DreamDioramaScene {
         if (hs > 0.02) {
           const wob = this.hedgeWobble[i];
           const squash = wob > 0 ? Math.sin(wob * Math.PI * 5) * wob * 0.16 : 0;
-          const sway = Math.sin(t * 1.4 + tr * 0.7 + tc * 0.5) * 0.014;
-          const hRand = hashCell(tr, tc);
           const heightVar = 0.92 + hRand * 0.16;
 
-          // Pillowy rounded shrub cushion base
+          // Pillowy base cushion
           this.scratchObj.position.set(wx, 0, wz);
-          this.scratchObj.rotation.set(sway, 0, sway * 0.7 + squash * 0.5);
+          this.scratchObj.rotation.set(windWave * 0.45, 0, windWave * 0.8 + squash * 0.5);
           this.scratchObj.scale.set(
             1 + squash * 0.45,
             hs * heightVar * morphHeightMul * (1 - squash * 0.35),
@@ -1615,204 +1656,198 @@ export class DreamDioramaScene {
           this.scratchObj.updateMatrix();
           this.hedgeBaseMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-          // Organic rounded puff crown (slightly rotated per tile for soft lush variety)
+          // Soft organic foliage puff crown
           this.scratchObj.position.set(
             wx + (hRand - 0.5) * 0.08,
             0,
-            wz + (hashCell(tc, tr) - 0.5) * 0.08
+            wz + (hRand2 - 0.5) * 0.08
           );
-          this.scratchObj.rotation.set(sway, hRand * Math.PI * 2, sway * 0.6 + squash * 0.5);
+          this.scratchObj.rotation.set(windWave * 0.65, hRand * Math.PI * 2, windWave + squash * 0.5);
           this.scratchObj.scale.set(
             (0.95 + hRand * 0.14) * (1 + squash * 0.5),
             hs * heightVar * morphHeightMul * (1 - squash * 0.35),
-            (0.95 + hashCell(tc, tr) * 0.14) * (1 + squash * 0.5)
+            (0.95 + hRand2 * 0.14) * (1 + squash * 0.5)
           );
           this.scratchObj.updateMatrix();
           this.hedgePuffMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-          // Occasional dainty poppy flower bud tucked on top of soft shrubs
-          if (hRand > 0.66) {
-            const budY = 1.04 * hs * heightVar * morphHeightMul;
-            this.scratchObj.position.set(
-              wx + (hRand - 0.8) * 0.55,
-              budY,
-              wz + (hashCell(tc + 3, tr) - 0.5) * 0.36
-            );
-            this.scratchObj.rotation.set(0, hRand * 6.28, 0);
-            this.scratchObj.scale.setScalar(hs * (1 - this.viewBlend * 0.8));
-            this.scratchObj.updateMatrix();
-            this.hedgeBudMesh.setMatrixAt(i, this.scratchObj.matrix);
-          } else {
-            this.scratchObj.position.set(wx, -10, wz);
-            this.scratchObj.scale.setScalar(0.0001);
-            this.scratchObj.updateMatrix();
-            this.hedgeBudMesh.setMatrixAt(i, this.scratchObj.matrix);
-          }
+          // Feathery pixel-art leafy sprig crown nestled cleanly atop the soft shrub!
+          this.scratchObj.position.set(wx, 0.36 * hs * heightVar * morphHeightMul, wz);
+          this.scratchObj.rotation.set(0, 0, 0);
+          this.scratchObj.scale.set(
+            (0.95 + hRand2 * 0.16) * hs,
+            hs * heightVar * morphHeightMul * (1 - this.viewBlend * 0.65),
+            1
+          );
+          this.scratchObj.updateMatrix();
+          this.shrubCrownMesh.setMatrixAt(i, this.scratchObj.matrix);
         } else {
           this.scratchObj.position.set(wx, -10, wz);
           this.scratchObj.scale.setScalar(0.0001);
           this.scratchObj.updateMatrix();
           this.hedgeBaseMesh.setMatrixAt(i, this.scratchObj.matrix);
           this.hedgePuffMesh.setMatrixAt(i, this.scratchObj.matrix);
-          this.hedgeBudMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.shrubCrownMesh.setMatrixAt(i, this.scratchObj.matrix);
         }
 
-        // BFS Living Mint Moss & Forget-Me-Not Dew Buds
+        // B. Lush Swaying Grass Fibres + Mossy Pebble Tufts on Open Meadow Tiles!
+        const openRatio = Math.max(0, 1 - hs);
+        if (openRatio > 0.05) {
+          const grassShow = openRatio * (1 - this.viewBlend * 0.85);
+          for (let g = 0; g < 3; g++) {
+            const slot = i * 3 + g;
+            const gh1 = hashCell(tr * 5 + g, tc * 3 + 11);
+            const gh2 = hashCell(tc * 7 + g, tr * 5 + 19);
+            const gx = wx + (gh1 - 0.5) * 0.72;
+            const gz = wz + (gh2 - 0.5) * 0.72;
+            const gScale = (0.78 + gh1 * 0.48) * grassShow;
+            this.scratchObj.position.set(gx, 0.0, gz);
+            this.scratchObj.rotation.set(0, gh2 * Math.PI, 0);
+            this.scratchObj.scale.setScalar(gScale);
+            this.scratchObj.updateMatrix();
+            this.grassFibreMesh.setMatrixAt(slot, this.scratchObj.matrix);
+          }
+
+          // Scatter mossy smooth pebbles with arching grass on ~18% of open meadow tiles (Ref #2)
+          if (hRand > 0.82 && this.pathTarget[i] < 0.1) {
+            this.scratchObj.position.set(wx + (hRand2 - 0.5) * 0.35, 0.0, wz + (hRand - 0.9) * 1.4);
+            this.scratchObj.rotation.set(0, hRand2 * Math.PI, 0);
+            this.scratchObj.scale.setScalar(grassShow * 0.95);
+            this.scratchObj.updateMatrix();
+            this.pebbleGrassMesh.setMatrixAt(i, this.scratchObj.matrix);
+          } else {
+            this.scratchObj.position.set(wx, -10, wz);
+            this.scratchObj.scale.setScalar(0.0001);
+            this.scratchObj.updateMatrix();
+            this.pebbleGrassMesh.setMatrixAt(i, this.scratchObj.matrix);
+          }
+        } else {
+          this.scratchObj.position.set(wx, -10, wz);
+          this.scratchObj.scale.setScalar(0.0001);
+          this.scratchObj.updateMatrix();
+          for (let g = 0; g < 3; g++) {
+            this.grassFibreMesh.setMatrixAt(i * 3 + g, this.scratchObj.matrix);
+          }
+          this.pebbleGrassMesh.setMatrixAt(i, this.scratchObj.matrix);
+        }
+
+        // C. BFS Living Foliage Wave: Vibrant Cobalt-Sapphire Dew Carpet + Bold Blue Hydrangea Clusters!
         this.mossScale[i] += (this.mossTarget[i] - this.mossScale[i]) * growthRate;
         const ms = this.mossScale[i];
         if (ms > 0.02) {
-          const isFront = this.frontierFlags[i] === 1;
-          const pulse = isFront ? 1.0 + Math.sin(t * 6.0 + i) * 0.12 : 1.0;
-
           this.scratchObj.position.set(wx, 0, wz);
           this.scratchObj.rotation.set(0, 0, 0);
-          this.scratchObj.scale.set(ms, ms * pulse, ms);
+          this.scratchObj.scale.setScalar(ms);
           this.scratchObj.updateMatrix();
           this.mossMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-          const h = hashCell(tr, tc);
-          const bx = wx + (h - 0.5) * 0.42;
-          const bz = wz + (hashCell(tc, tr) - 0.5) * 0.42;
-          const bSway = Math.sin(t * 2.8 + i) * 0.1;
-          this.scratchObj.position.set(bx, 0.03, bz);
-          this.scratchObj.rotation.set(bSway, h * Math.PI * 2, bSway * 0.6);
-          const budS = ms * (isFront ? 1.25 : 0.94);
-          this.scratchObj.scale.setScalar(budS);
-          this.scratchObj.updateMatrix();
-          this.bfsBudStemMesh.setMatrixAt(i, this.scratchObj.matrix);
-          this.bfsBudHeadMesh.setMatrixAt(i, this.scratchObj.matrix);
-
-          this.scratchColor.setHex(isFront ? 0x7dd3fc : h > 0.5 ? 0x93c5fd : 0x6ee7b7);
-          this.bfsBudHeadMesh.setColorAt(i, this.scratchColor);
+          // Show blue hydrangea mound on visited tiles not yet overtaken by shortest-path bouquets
+          const hydVis = ms * (1 - this.pathScale[i] * 0.92) * (1 - this.viewBlend * 0.85);
+          if (hydVis > 0.04) {
+            this.scratchObj.position.set(
+              wx + (hRand - 0.5) * 0.14,
+              0.08,
+              wz + (hRand2 - 0.5) * 0.14
+            );
+            this.scratchObj.rotation.set(0, 0, 0);
+            this.scratchObj.scale.setScalar(hydVis * (0.9 + hRand2 * 0.22));
+            this.scratchObj.updateMatrix();
+            this.bfsHydrangeaMesh.setMatrixAt(i, this.scratchObj.matrix);
+          } else {
+            this.scratchObj.position.set(wx, -10, wz);
+            this.scratchObj.scale.setScalar(0.0001);
+            this.scratchObj.updateMatrix();
+            this.bfsHydrangeaMesh.setMatrixAt(i, this.scratchObj.matrix);
+          }
         } else {
           this.scratchObj.position.set(wx, -10, wz);
           this.scratchObj.scale.setScalar(0.0001);
           this.scratchObj.updateMatrix();
           this.mossMesh.setMatrixAt(i, this.scratchObj.matrix);
-          this.bfsBudStemMesh.setMatrixAt(i, this.scratchObj.matrix);
-          this.bfsBudHeadMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.bfsHydrangeaMesh.setMatrixAt(i, this.scratchObj.matrix);
         }
 
-        // Shortest Path Living Vines & Bold Poppy Wildflowers
+        // D. Optimal Shortest Path: Radiant Sunlit Golden-Amber Highway + Tall Vivid Wildflower River!
         this.pathScale[i] += (this.pathTarget[i] - this.pathScale[i]) * Math.min(1, dt * 10);
         const ps = this.pathScale[i];
         if (ps > 0.02) {
-          const elastic = ps < 0.98 ? ps * (1 + Math.sin(ps * Math.PI) * 0.25) : 1.0;
+          const elastic = ps < 0.98 ? ps * (1 + Math.sin(ps * Math.PI) * 0.26) : 1.0;
           this.scratchObj.position.set(wx, 0.02, wz);
           this.scratchObj.rotation.set(0, 0, 0);
-          this.scratchObj.scale.set(elastic, elastic, elastic);
+          this.scratchObj.scale.setScalar(elastic);
           this.scratchObj.updateMatrix();
           this.pathVineMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-          for (let f = 0; f < 3; f++) {
-            const slot = i * 3 + f;
-            const fh1 = hashCell(tr * 3 + f, tc * 5 + 1);
-            const fh2 = hashCell(tc * 7 + f, tr * 3 + 2);
-            const fx = wx + (fh1 - 0.5) * 0.58;
-            const fz = wz + (fh2 - 0.5) * 0.58;
-            const sway = Math.sin(t * 2.4 + slot * 0.7) * 0.12;
-            const fHeight = (0.85 + fh1 * 0.45) * elastic;
+          const species = (tr * 3 + tc) % 3;
+          const flowerScale = elastic * (1.02 + hRand * 0.18) * (1 - this.viewBlend * 0.8);
 
-            this.scratchObj.position.set(fx, 0.06, fz);
-            this.scratchObj.rotation.set(sway, fh2 * Math.PI * 2, sway * 0.6);
-            this.scratchObj.scale.set(elastic, fHeight, elastic);
-            this.scratchObj.updateMatrix();
-            this.pathFlowerStemMesh.setMatrixAt(slot, this.scratchObj.matrix);
+          // Set active species matrix & hide other two
+          this.scratchObj.position.set(wx, -10, wz);
+          this.scratchObj.scale.setScalar(0.0001);
+          this.scratchObj.updateMatrix();
+          this.pathPoppyMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.pathMarigoldMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.pathPeonyMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-            this.scratchObj.position.set(fx, 0.06 + 0.41 * fHeight, fz);
-            this.scratchObj.rotation.set(sway, t * 0.4 + fh1 * 6.28, sway * 0.5);
-            this.scratchObj.scale.setScalar(elastic * (0.94 + fh2 * 0.36));
-            this.scratchObj.updateMatrix();
-            this.pathFlowerPetalMesh.setMatrixAt(slot, this.scratchObj.matrix);
-
-            this.scratchObj.position.set(fx, 0.11 + 0.41 * fHeight, fz);
-            this.scratchObj.scale.setScalar(elastic);
-            this.scratchObj.updateMatrix();
-            this.pathFlowerCoreMesh.setMatrixAt(slot, this.scratchObj.matrix);
-
-            const colIdx =
-              Math.floor((fh1 + this.pathOrder[i]) * FLOWER_PALETTE.length) %
-              FLOWER_PALETTE.length;
-            this.scratchColor.setHex(FLOWER_PALETTE[colIdx]);
-            this.pathFlowerPetalMesh.setColorAt(slot, this.scratchColor);
-          }
+          this.scratchObj.position.set(wx, 0.16, wz);
+          this.scratchObj.rotation.set(0, 0, 0);
+          this.scratchObj.scale.setScalar(flowerScale);
+          this.scratchObj.updateMatrix();
+          if (species === 0) this.pathPoppyMesh.setMatrixAt(i, this.scratchObj.matrix);
+          else if (species === 1) this.pathMarigoldMesh.setMatrixAt(i, this.scratchObj.matrix);
+          else this.pathPeonyMesh.setMatrixAt(i, this.scratchObj.matrix);
         } else {
           this.scratchObj.position.set(wx, -10, wz);
           this.scratchObj.scale.setScalar(0.0001);
           this.scratchObj.updateMatrix();
           this.pathVineMesh.setMatrixAt(i, this.scratchObj.matrix);
-          for (let f = 0; f < 3; f++) {
-            const slot = i * 3 + f;
-            this.pathFlowerStemMesh.setMatrixAt(slot, this.scratchObj.matrix);
-            this.pathFlowerPetalMesh.setMatrixAt(slot, this.scratchObj.matrix);
-            this.pathFlowerCoreMesh.setMatrixAt(slot, this.scratchObj.matrix);
-          }
+          this.pathPoppyMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.pathMarigoldMesh.setMatrixAt(i, this.scratchObj.matrix);
+          this.pathPeonyMesh.setMatrixAt(i, this.scratchObj.matrix);
         }
       }
 
       this.hedgeBaseMesh.instanceMatrix.needsUpdate = true;
       this.hedgePuffMesh.instanceMatrix.needsUpdate = true;
-      this.hedgeBudMesh.instanceMatrix.needsUpdate = true;
+      this.shrubCrownMesh.instanceMatrix.needsUpdate = true;
+      this.grassFibreMesh.instanceMatrix.needsUpdate = true;
+      this.pebbleGrassMesh.instanceMatrix.needsUpdate = true;
       this.mossMesh.instanceMatrix.needsUpdate = true;
-      this.bfsBudStemMesh.instanceMatrix.needsUpdate = true;
-      this.bfsBudHeadMesh.instanceMatrix.needsUpdate = true;
-      if (this.bfsBudHeadMesh.instanceColor) this.bfsBudHeadMesh.instanceColor.needsUpdate = true;
+      this.bfsHydrangeaMesh.instanceMatrix.needsUpdate = true;
       this.pathVineMesh.instanceMatrix.needsUpdate = true;
-      this.pathFlowerStemMesh.instanceMatrix.needsUpdate = true;
-      this.pathFlowerPetalMesh.instanceMatrix.needsUpdate = true;
-      this.pathFlowerCoreMesh.instanceMatrix.needsUpdate = true;
-      if (this.pathFlowerPetalMesh.instanceColor) {
-        this.pathFlowerPetalMesh.instanceColor.needsUpdate = true;
-      }
+      this.pathPoppyMesh.instanceMatrix.needsUpdate = true;
+      this.pathMarigoldMesh.instanceMatrix.needsUpdate = true;
+      this.pathPeonyMesh.instanceMatrix.needsUpdate = true;
     }
 
-    // 6. Interactive & Ambient Meadow Wildflowers
-    for (let i = 0; i < this.maxUserBlooms * 2; i++) {
-      const bloomIdx = Math.floor(i / 2);
-      const sub = i % 2;
-      const b = this.interactiveBlooms[bloomIdx];
-      if (b) {
-        if (sub === 0) {
-          b.scale += (b.targetScale - b.scale) * Math.min(1, dt * 11);
-        }
-        const ox = sub === 0 ? 0 : Math.cos(b.rotY) * 0.22;
-        const oz = sub === 0 ? 0 : Math.sin(b.rotY) * 0.22;
-        const s = b.scale * (sub === 0 ? 1.05 : 0.82);
-        const sway = Math.sin(t * 2.5 + b.seed + sub) * 0.1;
+    // 7. Interactive & Ambient Meadow Detailed Pixel Bouquets
+    for (let i = 0; i < this.maxUserBlooms; i++) {
+      const b = this.interactiveBlooms[i];
+      // Reset all three species slots to hidden first
+      this.scratchObj.position.set(0, -10, 0);
+      this.scratchObj.scale.setScalar(0.0001);
+      this.scratchObj.updateMatrix();
+      this.userPoppyMesh.setMatrixAt(i, this.scratchObj.matrix);
+      this.userMarigoldMesh.setMatrixAt(i, this.scratchObj.matrix);
+      this.userPeonyMesh.setMatrixAt(i, this.scratchObj.matrix);
 
-        this.scratchObj.position.set(b.x + ox, 0.01, b.z + oz);
-        this.scratchObj.rotation.set(sway, b.rotY + sub, sway * 0.5);
+      if (b) {
+        b.scale += (b.targetScale - b.scale) * Math.min(1, dt * 11);
+        const s = b.scale * (1 - this.viewBlend * 0.85);
+        this.scratchObj.position.set(b.x, 0.01, b.z);
+        this.scratchObj.rotation.set(0, b.rotY, 0);
         this.scratchObj.scale.setScalar(s);
         this.scratchObj.updateMatrix();
-        this.userFlowerStemMesh.setMatrixAt(i, this.scratchObj.matrix);
-
-        this.scratchObj.position.set(b.x + ox, 0.27 * s, b.z + oz);
-        this.scratchObj.updateMatrix();
-        this.userFlowerPetalMesh.setMatrixAt(i, this.scratchObj.matrix);
-
-        this.scratchObj.position.set(b.x + ox, 0.3 * s, b.z + oz);
-        this.scratchObj.updateMatrix();
-        this.userFlowerCoreMesh.setMatrixAt(i, this.scratchObj.matrix);
-
-        this.scratchColor.setHex(b.colorHex);
-        this.userFlowerPetalMesh.setColorAt(i, this.scratchColor);
-      } else {
-        this.scratchObj.position.set(0, -10, 0);
-        this.scratchObj.scale.setScalar(0.0001);
-        this.scratchObj.updateMatrix();
-        this.userFlowerStemMesh.setMatrixAt(i, this.scratchObj.matrix);
-        this.userFlowerPetalMesh.setMatrixAt(i, this.scratchObj.matrix);
-        this.userFlowerCoreMesh.setMatrixAt(i, this.scratchObj.matrix);
+        if (b.species === 0) this.userPoppyMesh.setMatrixAt(i, this.scratchObj.matrix);
+        else if (b.species === 1) this.userMarigoldMesh.setMatrixAt(i, this.scratchObj.matrix);
+        else this.userPeonyMesh.setMatrixAt(i, this.scratchObj.matrix);
       }
     }
-    this.userFlowerStemMesh.instanceMatrix.needsUpdate = true;
-    this.userFlowerPetalMesh.instanceMatrix.needsUpdate = true;
-    this.userFlowerCoreMesh.instanceMatrix.needsUpdate = true;
-    if (this.userFlowerPetalMesh.instanceColor) {
-      this.userFlowerPetalMesh.instanceColor.needsUpdate = true;
-    }
+    this.userPoppyMesh.instanceMatrix.needsUpdate = true;
+    this.userMarigoldMesh.instanceMatrix.needsUpdate = true;
+    this.userPeonyMesh.instanceMatrix.needsUpdate = true;
 
-    // 7. Articulated Gliding Bluebirds
+    // 8. Articulated Gliding Bluebirds
     for (const bf of this.birds) {
       bf.swoop = Math.max(0, bf.swoop - dt * 1.4);
       const ang = t * bf.speed + bf.phase;
@@ -1835,7 +1870,7 @@ export class DreamDioramaScene {
       bf.bird.rightWing.rotation.z = -flap;
     }
 
-    // 8. Fluttering Pastel Butterflies
+    // 9. Fluttering Pastel Butterflies
     for (const b of this.butterflies) {
       const a = t * b.speed + b.phase;
       const bx = b.centerX + Math.cos(a) * b.radius;
@@ -1852,7 +1887,7 @@ export class DreamDioramaScene {
       b.bf.rightWing.rotation.y = -flap;
     }
 
-    // 9. Update 3D Pixel Particles
+    // 10. 3D Pixel Particles
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
       if (p.active) {
@@ -1867,7 +1902,7 @@ export class DreamDioramaScene {
           p.vy -= 4.2 * dt;
           p.vx *= 0.97;
           p.vz *= 0.97;
-          p.x += p.vx * dt;
+          p.x += (p.vx + Math.sin(t * 2.1) * 0.45) * dt; // Drifts gently with the wind!
           p.y = Math.max(0.05, p.y + p.vy * dt);
           p.z += p.vz * dt;
           p.rotX += p.vRot * dt;
@@ -1890,7 +1925,7 @@ export class DreamDioramaScene {
     this.particleMesh.instanceMatrix.needsUpdate = true;
     if (this.particleMesh.instanceColor) this.particleMesh.instanceColor.needsUpdate = true;
 
-    // 10. Update Expanding Water/Dew Ripples
+    // 11. Expanding Water/Dew Ripples
     for (const r of this.ripples) {
       if (!r.active) continue;
       r.age += dt;
@@ -1905,7 +1940,7 @@ export class DreamDioramaScene {
       }
     }
 
-    // 11. Subtle pulse on meadow cursor halo
+    // 12. Meadow cursor halo pulse
     if (this.cursorHalo.visible) {
       this.cursorHalo.scale.setScalar(1 + Math.sin(t * 4.5) * 0.08);
     }
@@ -1961,6 +1996,7 @@ export class DreamDioramaScene {
     const dom = this.renderer.domElement;
     dom.removeEventListener('pointerdown', this.boundPointerDown);
     dom.removeEventListener('wheel', this.boundWheel);
+    dom.removeEventListener('contextmenu', this.boundContextMenu);
     window.removeEventListener('pointermove', this.boundPointerMove);
     window.removeEventListener('pointerup', this.boundPointerUp);
     window.removeEventListener('pointercancel', this.boundPointerUp);
@@ -1977,6 +2013,7 @@ export class DreamDioramaScene {
     this.waterMat.dispose();
 
     this.textures.dispose();
+    this.sprites.dispose();
     this.envRenderTarget.dispose();
     this.pmrem.dispose();
     this.renderer.dispose();
