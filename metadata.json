@@ -1,0 +1,6 @@
+{
+  "name": "Hedgerow",
+  "description": "An interactive 2.5D pixel-art botanical hedge maze laboratory for exploring Disjoint Set (Union-Find) maze generation and Breadth-First Search (BFS) shortest-path finding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
